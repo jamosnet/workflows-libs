@@ -17,68 +17,73 @@ import (
 // 定义常量
 const (
 	ProcessName = "Weixin.exe"
-	DllName     = "wx_key.dll" // 确保 dll 在同级目录或 PATH 中
+	DllName     = "wx_key.dll"
 )
 
-// DLL 封装结构体
+// KeyDumper 结构体
 type KeyDumper struct {
-	dll              *syscall.LazyDLL
-	initializeHook   *syscall.LazyProc
-	pollKeyData      *syscall.LazyProc
-	getStatusMessage *syscall.LazyProc
-	cleanupHook      *syscall.LazyProc
-	getLastErrorMsg  *syscall.LazyProc
-	isHooked         bool
+	dll *syscall.LazyDLL
+
+	// 内部保存的 DLL 函数指针 (lazy proc)
+	// 命名习惯：小写开头，对应 DLL 里的函数
+	procInitializeHook   *syscall.LazyProc
+	procPollKeyData      *syscall.LazyProc
+	procGetStatusMessage *syscall.LazyProc
+	procCleanupHook      *syscall.LazyProc
+	procGetLastErrorMsg  *syscall.LazyProc
+
+	isHooked bool
 }
 
 // 加载 DLL
 func NewKeyDumper() (*KeyDumper, error) {
-	// 获取当前路径，确保能找到 dll
 	exePath, _ := os.Executable()
 	dllPath := filepath.Join(filepath.Dir(exePath), DllName)
-	
-	// 也可以直接加载，取决于你的环境
-	dll := syscall.NewLazyDLL(dllPath) 
+
+	dll := syscall.NewLazyDLL(dllPath)
 	if err := dll.Load(); err != nil {
-		// 尝试直接加载文件名（如果还在系统路径里）
 		dll = syscall.NewLazyDLL(DllName)
 		if err := dll.Load(); err != nil {
 			return nil, fmt.Errorf("无法加载 %s: %v", DllName, err)
 		}
 	}
 
+	// 绑定 DLL 函数
+	// 这里的字符串参数必须和 C++ DLL 的导出名一模一样
 	return &KeyDumper{
-		dll:              dll,
-		initializeHook:   dll.NewProc("InitializeHook"),
-		pollKeyData:      dll.NewProc("PollKeyData"),
-		getStatusMessage: dll.NewProc("GetStatusMessage"),
-		cleanupHook:      dll.NewProc("CleanupHook"),
-		getLastErrorMsg:  dll.NewProc("GetLastErrorMsg"),
+		dll:                  dll,
+		procInitializeHook:   dll.NewProc("InitializeHook"),
+		procPollKeyData:      dll.NewProc("PollKeyData"),
+		procGetStatusMessage: dll.NewProc("GetStatusMessage"),
+		procCleanupHook:      dll.NewProc("CleanupHook"),
+		procGetLastErrorMsg:  dll.NewProc("GetLastErrorMsg"),
 	}, nil
 }
 
-// 1. 初始化 Hook
-func (kd *KeyDumper) Initialize(pid uint32) error {
-	ret, _, _ := kd.initializeHook.Call(uintptr(pid))
-	if ret == 0 { // 返回 false
-		errMsg := kd.GetLastError()
-		return fmt.Errorf("初始化失败: %s", errMsg)
+// =========================================================================
+// 下面是封装方法，方法名现在与 DLL 导出名严格保持一致
+// =========================================================================
+
+// 对应 DLL: InitializeHook
+func (kd *KeyDumper) InitializeHook(pid uint32) error {
+	ret, _, _ := kd.procInitializeHook.Call(uintptr(pid))
+	if ret == 0 {
+		errMsg := kd.GetLastErrorMsg()
+		return fmt.Errorf("InitializeHook 失败: %s", errMsg)
 	}
 	kd.isHooked = true
 	return nil
 }
 
-// 2. 轮询密钥
-func (kd *KeyDumper) PollKey() string {
-	// 指南建议缓冲区 >= 65，我们给 128 安全点
+// 对应 DLL: PollKeyData
+func (kd *KeyDumper) PollKeyData() string {
 	buf := make([]byte, 128)
-	ret, _, _ := kd.pollKeyData.Call(
+	ret, _, _ := kd.procPollKeyData.Call(
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(len(buf)),
 	)
 
-	if ret != 0 { // 返回 true
-		// 转换 C string 到 Go string
+	if ret != 0 {
 		n := bytes.IndexByte(buf, 0)
 		if n == -1 {
 			n = len(buf)
@@ -88,12 +93,13 @@ func (kd *KeyDumper) PollKey() string {
 	return ""
 }
 
-// 3. 获取日志
-func (kd *KeyDumper) GetLog() (string, int) {
+// 对应 DLL: GetStatusMessage
+// 虽然名字叫 GetStatusMessage，但为了 Go 好用，我们还是返回 (string, int)
+func (kd *KeyDumper) GetStatusMessage() (string, int) {
 	buf := make([]byte, 512)
 	var level int32
 
-	ret, _, _ := kd.getStatusMessage.Call(
+	ret, _, _ := kd.procGetStatusMessage.Call(
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(len(buf)),
 		uintptr(unsafe.Pointer(&level)),
@@ -109,23 +115,23 @@ func (kd *KeyDumper) GetLog() (string, int) {
 	return "", -1
 }
 
-// 4. 清理 Hook (至关重要)
-func (kd *KeyDumper) Cleanup() {
+// 对应 DLL: CleanupHook
+func (kd *KeyDumper) CleanupHook() {
 	if kd.isHooked {
-		fmt.Println("\n[System] 正在清理 Hook 痕迹...")
-		kd.cleanupHook.Call()
+		fmt.Println("\n[System] 执行 CleanupHook ...")
+		kd.procCleanupHook.Call()
 		kd.isHooked = false
-		fmt.Println("[System] 清理完成，安全退出。")
+		fmt.Println("[System] 清理完成。")
 	}
 }
 
-// 辅助：获取错误信息 (char* 转 string)
-func (kd *KeyDumper) GetLastError() string {
-	ret, _, _ := kd.getLastErrorMsg.Call()
+// 对应 DLL: GetLastErrorMsg
+func (kd *KeyDumper) GetLastErrorMsg() string {
+	ret, _, _ := kd.procGetLastErrorMsg.Call()
 	if ret == 0 {
 		return "Unknown error"
 	}
-	// 读取内存中的 C 字符串
+	// 处理 char* 返回值
 	ptr := unsafe.Pointer(ret)
 	buf := make([]byte, 0, 256)
 	for {
@@ -182,31 +188,30 @@ func main() {
 		log.Fatalf("[Error] DLL加载失败: %v", err)
 	}
 
-	// 3. 监听中断信号 (Ctrl+C)，确保清理
+	// 3. 监听中断信号 (Ctrl+C)
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		dumper.Cleanup()
+		fmt.Println("\n[Info] 用户手动中断")
+		dumper.CleanupHook()
 		os.Exit(0)
 	}()
 
 	// 4. 初始化 Hook
-	log.Println("[Init] 正在注入 Hook...")
-	if err := dumper.Initialize(pid); err != nil {
+	log.Println("[Init] 正在注入 Hook (InitializeHook)...")
+	if err := dumper.InitializeHook(pid); err != nil {
 		log.Fatalf("[Error] %v", err)
 	}
-	log.Println("[Success] Hook 初始化成功！请打开微信并点击聊天窗口...")
+	log.Println("[Success] Hook 初始化成功！请打开微信并点击任意聊天窗口...")
 
 	// 5. 循环轮询
-	foundKeys := make(map[string]bool)
-	
 	for {
-		// --- 轮询日志 ---
+		// --- 轮询日志 (GetStatusMessage) ---
 		for {
-			msg, level := dumper.GetLog()
+			msg, level := dumper.GetStatusMessage()
 			if level == -1 {
-				break // 没有日志了
+				break
 			}
 			prefix := "[INFO]"
 			switch level {
@@ -218,20 +223,20 @@ func main() {
 			fmt.Printf("%s [DLL] %s\n", prefix, msg)
 		}
 
-		// --- 轮询密钥 ---
-		key := dumper.PollKey()
+		// --- 轮询密钥 (PollKeyData) ---
+		key := dumper.PollKeyData()
 		if key != "" {
-			if !foundKeys[key] {
-				foundKeys[key] = true
-				fmt.Println("\n========================================")
-				fmt.Println("           捕获到新的密钥")
-				fmt.Println("========================================")
-				fmt.Printf("Key: %s\n", key)
-				fmt.Println("========================================")
-				
-				// 注意：这里我不主动退出，因为可能还有图片Key或其他Key
-				// 如果你想拿一个就跑，可以在这里调用 dumper.Cleanup() 然后 break
-			}
+			fmt.Println("\n========================================")
+			fmt.Println("           捕获到新的密钥")
+			fmt.Println("========================================")
+			fmt.Printf("Key: %s\n", key)
+			fmt.Println("========================================")
+
+			// 拿到 Key 后，按顺序清理并退出
+			dumper.CleanupHook()
+			fmt.Println("[System] 密钥已保存，程序退出。")
+			time.Sleep(500 * time.Millisecond)
+			os.Exit(0)
 		}
 
 		time.Sleep(100 * time.Millisecond)
