@@ -1,0 +1,46 @@
+name: 手动构建 (Windows)
+
+# 核心配置：只保留 workflow_dispatch，这就意味着只能手动点按钮触发
+on: 
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 拉取代码
+      - uses: actions/checkout@v4
+
+      # 2. 配置 Go 环境
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      # 3. 解决依赖 (不管你本地环境多乱，这里是全新环境，自动帮你搞定)
+      - name: 下载依赖
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init keydumper
+          fi
+          # 强制下载你代码里用到的库
+          go get golang.org/x/sys/windows
+          go mod tidy
+
+      # 4. 编译 (同时生成 64位 和 32位，以防万一)
+      - name: 开始编译
+        run: |
+          # 编译 64位 (现在的微信多是64位)
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o dumper_64.exe .
+          
+          # 编译 32位 (备用)
+          CGO_ENABLED=0 GOOS=windows GOARCH=386 go build -ldflags "-s -w" -o dumper_32.exe .
+
+      # 5. 上传结果供你下载
+      - name: 上传文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows_exe_files
+          path: |
+            dumper_64.exe
+            dumper_32.exe
+          retention-days: 1 # 文件只保留1天，省空间
